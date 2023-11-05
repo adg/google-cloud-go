@@ -1164,6 +1164,27 @@ func applyMutations(tbl *table, r *row, muts []*btpb.Mutation, fs map[string]*co
 			delete(r.families, fampre)
 		}
 	}
+
+	commit := time.Now().Round(time.Microsecond)
+	mutsCopy := make([]*btpb.Mutation, len(muts))
+	for i, m := range muts {
+		m := proto.Clone(m).(*btpb.Mutation)
+		if sc := m.GetSetCell(); m != nil {
+			if sc.TimestampMicros == -1 {
+				sc.TimestampMicros = commit.UnixNano() / 1000
+			}
+		}
+		mutsCopy[i] = m
+	}
+	tbl.changeMu.Lock()
+	tbl.changes = append(tbl.changes, &changeStreamEntry{
+		rowKey: r.key,
+		commit: commit,
+		muts:   mutsCopy,
+	})
+	tbl.changeCond.Broadcast()
+	tbl.changeMu.Unlock()
+
 	return nil
 }
 
@@ -1329,6 +1350,89 @@ func (s *server) SampleRowKeys(req *btpb.SampleRowKeysRequest, stream btpb.Bigta
 	return err
 }
 
+func (s *server) GenerateInitialChangeStreamPartitions(req *btpb.GenerateInitialChangeStreamPartitionsRequest, srv btpb.Bigtable_GenerateInitialChangeStreamPartitionsServer) error {
+	return srv.Send(&btpb.GenerateInitialChangeStreamPartitionsResponse{
+		Partition: &btpb.StreamPartition{
+			RowRange: &btpb.RowRange{
+				StartKey: &btpb.RowRange_StartKeyClosed{
+					StartKeyClosed: nil,
+				},
+				EndKey: &btpb.RowRange_EndKeyOpen{
+					EndKeyOpen: nil,
+				},
+			},
+		},
+	})
+}
+
+func (s *server) ReadChangeStream(req *btpb.ReadChangeStreamRequest, srv btpb.Bigtable_ReadChangeStreamServer) error {
+	s.mu.Lock()
+	tbl, ok := s.tables[req.TableName]
+	s.mu.Unlock()
+	if !ok {
+		return status.Errorf(codes.NotFound, "table %q not found", req.TableName)
+	}
+	// TODO: check req.Partition
+
+	changesIdx := 0
+
+	switch st := req.StartFrom.(type) {
+	case *btpb.ReadChangeStreamRequest_StartTime:
+		start := st.StartTime.AsTime()
+		tbl.changeMu.Lock()
+		for _, c := range tbl.changes {
+			if !c.commit.Before(start) {
+				break
+			}
+			changesIdx++
+		}
+		tbl.changeMu.Unlock()
+	case *btpb.ReadChangeStreamRequest_ContinuationTokens:
+		// TODO
+	}
+
+	ctx := srv.Context()
+	go func() {
+		<-ctx.Done()
+		tbl.changeCond.Broadcast()
+	}()
+	for {
+		tbl.changeMu.Lock()
+		for changesIdx >= len(tbl.changes) && ctx.Err() == nil {
+			tbl.changeCond.Wait()
+		}
+		if ctx.Err() != nil {
+			tbl.changeMu.Unlock()
+			return ctx.Err()
+		}
+		ch := tbl.changes[changesIdx]
+		tbl.changeMu.Unlock()
+		changesIdx++
+
+		if end := req.EndTime; end != nil && ch.commit.After(end.AsTime()) {
+			// TODO: CloseStream?
+			return nil
+		}
+
+		dc := &btpb.ReadChangeStreamResponse_DataChange{
+			Type:                  btpb.ReadChangeStreamResponse_DataChange_USER,
+			RowKey:                []byte(ch.rowKey),
+			CommitTimestamp:       timestamppb.New(ch.commit),
+			Done:                  true,
+			Token:                 fmt.Sprintf("changesIdx=%d", changesIdx),
+			EstimatedLowWatermark: timestamppb.New(ch.commit),
+		}
+		for _, m := range ch.muts {
+			dc.Chunks = append(dc.Chunks, &btpb.ReadChangeStreamResponse_MutationChunk{Mutation: m})
+		}
+		if err := srv.Send(&btpb.ReadChangeStreamResponse{
+			StreamRecord: &btpb.ReadChangeStreamResponse_DataChange_{DataChange: dc},
+		}); err != nil {
+			return err
+		}
+	}
+}
+
 // needGC is invoked whenever the server needs gcloop running.
 func (s *server) needGC() {
 	s.mu.Lock()
@@ -1373,6 +1477,16 @@ type table struct {
 	families    map[string]*columnFamily // keyed by plain family name
 	rows        *btree.BTree             // indexed by row key
 	isProtected bool                     // whether this table has deletion protection
+
+	changeMu   sync.Mutex
+	changeCond *sync.Cond
+	changes    []*changeStreamEntry
+}
+
+type changeStreamEntry struct {
+	rowKey string
+	commit time.Time
+	muts   []*btpb.Mutation
 }
 
 const btreeDegree = 16
@@ -1390,12 +1504,14 @@ func newTable(ctr *btapb.CreateTableRequest) *table {
 			c++
 		}
 	}
-	return &table{
+	tbl := &table{
 		families:    fams,
 		counter:     c,
 		rows:        btree.New(btreeDegree),
 		isProtected: ctr.GetTable().GetDeletionProtection(),
 	}
+	tbl.changeCond = sync.NewCond(&tbl.changeMu)
+	return tbl
 }
 
 func (t *table) validTimestamp(ts int64) bool {
